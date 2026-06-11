@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通AI自动答题
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.1.3
 // @description  调用DeepSeek/MiMo AI自动完成学习通作业和考试题目
 // @author       You
 // @match        *://*.chaoxing.com/*
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @connect      api.deepseek.com
 // @connect      api.xiaomimimo.com
 // @connect      *
@@ -47,6 +48,49 @@
         deepseek: 'https://api.deepseek.com/chat/completions',
         mimo: 'https://api.xiaomimimo.com/v1/chat/completions',
     };
+
+    // ==================== 全局防崩溃拦截器 ====================
+    // 拦截学习通自带的 loadEditorAnswerd 和 UEditor 的报错
+    setInterval(() => {
+        const patchLoadEditor = (win) => {
+            try {
+                if (win.loadEditorAnswerd && !win.loadEditorAnswerd._patched) {
+                    const orig = win.loadEditorAnswerd;
+                    win.loadEditorAnswerd = function() {
+                        try { return orig.apply(this, arguments); } catch (e) {}
+                    };
+                    win.loadEditorAnswerd._patched = true;
+                }
+            } catch (e) {}
+        };
+        const patchUE = (win) => {
+            try {
+                if (win.UE && win.UE.Editor && win.UE.Editor.prototype && !win.UE._patchedByAI) {
+                    const origHasContents = win.UE.Editor.prototype.hasContents;
+                    win.UE.Editor.prototype.hasContents = function(tags) {
+                        try { return origHasContents.call(this, tags); } catch (e) { return true; }
+                    };
+                    const origGetContent = win.UE.Editor.prototype.getContent;
+                    win.UE.Editor.prototype.getContent = function() {
+                        try { return origGetContent.apply(this, arguments); } catch (e) { return this.body ? this.body.innerHTML : ''; }
+                    };
+                    win.UE._patchedByAI = true;
+                }
+            } catch (e) {}
+        };
+
+        try { if (typeof unsafeWindow !== 'undefined') { patchLoadEditor(unsafeWindow); patchUE(unsafeWindow); } } catch(e) {}
+        try { patchLoadEditor(window); patchUE(window); } catch(e) {}
+        
+        document.querySelectorAll('iframe').forEach(f => {
+            try { 
+                if (f.contentWindow) {
+                    patchLoadEditor(f.contentWindow);
+                    patchUE(f.contentWindow);
+                }
+            } catch(e) {}
+        });
+    }, 1000);
 
     // 题型映射
     const QUESTION_TYPES = {
@@ -630,19 +674,67 @@
             // 方式4: 从 DOM 结构推断
             if (answerType === -1) {
                 const hasOptions = el.querySelectorAll('.answerBg').length > 0;
-                const hasBlanks = el.querySelectorAll('.Answer textarea, .Answer .tiankong').length > 0;
+                // 查找填空元素：先在 el 内部找，再在兄弟/.TiMu 父级找
+                let hasBlanks = el.querySelectorAll(
+                    '.Answer textarea, .Answer .tiankong, .Answer input[type="text"], ' +
+                    '.blank_box input, .tkInput, input.cloze, .cloze input, ' +
+                    '[class*="fillblank"] input, [class*="tiankong"] input, ' +
+                    '.mark_name input[type="text"], .mark_name textarea'
+                ).length > 0;
+
+                // 如果内部找不到，查找兄弟节点
+                if (!hasBlanks) {
+                    let sib = el.nextElementSibling;
+                    while (sib && !hasBlanks) {
+                        if (sib.classList.contains('questionLi') || sib.classList.contains('TiMu')) break;
+                        
+                        // 查找兄弟节点本身或是其内部的元素
+                        const elementsToCheck = [sib, ...Array.from(sib.querySelectorAll('.Answer, [class*="blank"]'))];
+                        for (const target of elementsToCheck) {
+                            if (target.classList.contains('Answer') || target.tagName === 'TEXTAREA' || target.tagName === 'IFRAME') {
+                                hasBlanks = true;
+                                break;
+                            }
+                        }
+                        sib = sib.nextElementSibling;
+                    }
+                }
+                // 再查父元素
+                if (!hasBlanks) {
+                    const timu = el.closest('.TiMu') || el.parentElement;
+                    if (timu) {
+                        hasBlanks = timu.querySelectorAll('.Answer textarea, .Answer iframe, .Answer [contenteditable]').length > 0;
+                    }
+                }
+
                 if (hasOptions && !hasBlanks) {
-                    // 有选项无填空 = 选择题或判断题
                     const optCount = el.querySelectorAll('.answerBg').length;
-                    answerType = optCount === 2 ? 2 : 0; // 2个选项=判断题，否则=单选题
+                    answerType = optCount === 2 ? 2 : 0;
                 } else if (hasBlanks && !hasOptions) {
                     answerType = 3; // 填空题
+                } else if (hasBlanks && hasOptions) {
+                    answerType = 0; // 有选项有填空，默认选择题
                 }
             }
 
             if (!typeName && answerType >= 0) {
                 typeName = QUESTION_TYPES[answerType] || '未知';
             }
+
+            // 【关键修复】处理 answerType 与 typeName 冲突的问题
+            // 某些页面 input[name="answertype"] 的值可能不符合默认映射
+            if (typeName.includes('单选')) answerType = 0;
+            else if (typeName.includes('多选')) answerType = 1;
+            else if (typeName.includes('判断')) answerType = 2;
+            else if (typeName.includes('填空')) answerType = 3;
+            else if (typeName.includes('简答')) answerType = 4;
+            else if (typeName.includes('论述')) answerType = 5;
+            else if (typeName.includes('计算')) answerType = 6;
+            else if (typeName.includes('问答')) answerType = 7;
+
+
+
+            // Logger.info(`[诊断] 解析题目第 ${index+1} 题: 修正后 answerType=${answerType}, typeName=${typeName}`);
 
             // 获取题目文本 - 多种选择器
             const titleEl = el.querySelector('h3.mark_name') ||
@@ -694,15 +786,30 @@
                 options.push({ label, text, element: opt });
             });
 
-            // 获取填空题区域 - 多种选择器
+            // 获取填空题区域 - 多种选择器（按优先级）
             const blanks = [];
             const blankSelectors = [
+                // 填空题专用输入
+                '.blank_box input[type="text"]',
+                '.blank_box textarea',
+                '.tkInput',
+                'input.cloze',
+                '.cloze input',
+                '[class*="fillblank"] input',
+                '[class*="tiankong"] input',
+                '.Answer input[type="text"]',
                 '.Answer textarea',
                 '.Answer .tiankong + textarea',
                 'textarea[name^="answerEditor"]',
+                // UEditor 组件
                 '.edui-editor textarea',
-                'textarea',
+                '.edui-body-container',
+                '.Answer .edui-body-container',
+                // 通用输入
+                '.answer_content input[type="text"]',
+                '.answer_content textarea',
                 'input[type="text"][name*="answer"]',
+                'input[type="text"][name*="blank"]',
                 '.blank input',
                 '[contenteditable="true"]'
             ];
@@ -710,29 +817,93 @@
             let blankElements = [];
             for (const sel of blankSelectors) {
                 blankElements = el.querySelectorAll(sel);
-                if (blankElements.length > 0) break;
+                if (blankElements.length > 0) {
+                    // Logger.info(`通过 ${sel} 找到 ${blankElements.length} 个填空元素`);
+                    break;
+                }
             }
 
             blankElements.forEach((container, i) => {
+                const vis = container.offsetParent !== null ? '可见' : '隐藏';
+                const cls = (container.className || '').toString().substring(0, 30);
+                // Logger.info(`  空白[${i}]: <${container.tagName.toLowerCase()}> class="${cls}" ${vis}`);
                 blanks.push({ index: i, element: container, tag: container.tagName.toLowerCase() });
             });
 
-            // 如果没找到填空元素，尝试从 .Answer 容器查找
+            // 如果没找到填空元素，尝试从 .Answer 容器查找（包括兄弟节点）
             if (blanks.length === 0) {
-                const answerContainers = el.querySelectorAll('.Answer, .answer_content, [class*="blank"]');
+                // 先查 el 内部
+                let answerContainers = Array.from(el.querySelectorAll('.Answer, .answer_content, [class*="blank"], [class*="Blank"]'));
+                // 再查兄弟节点
+                if (answerContainers.length === 0) {
+                    let sib = el.nextElementSibling;
+                    while (sib) {
+                        if (sib.classList.contains('questionLi') || sib.classList.contains('TiMu')) break;
+                        
+                        // 把兄弟节点本身，以及兄弟节点内的 .Answer 元素都收集起来
+                        if (sib.classList.contains('Answer')) {
+                            answerContainers.push(sib);
+                        } else {
+                            const nested = sib.querySelectorAll('.Answer, [class*="blank"]');
+                            nested.forEach(a => answerContainers.push(a));
+                        }
+                        // 甚至直接把兄弟节点当做可能得容器，如果有 textarea/iframe 的话
+                        if (sib.querySelector('textarea, iframe, [contenteditable]')) {
+                            answerContainers.push(sib);
+                        }
+                        
+                        sib = sib.nextElementSibling;
+                    }
+                }
+                // 再查父元素
+                if (answerContainers.length === 0) {
+                    const timu = el.closest('.TiMu') || el.parentElement;
+                    if (timu) {
+                        answerContainers = Array.from(timu.querySelectorAll('.Answer'));
+                    }
+                }
+
                 answerContainers.forEach((container, i) => {
-                    const textarea = container.querySelector('textarea') ||
-                                    container.querySelector('input[type="text"]') ||
-                                    container.querySelector('[contenteditable]');
+                    const textarea = container.querySelector('input[type="text"]') ||
+                                    container.querySelector('textarea') ||
+                                    container.querySelector('.edui-body-container') ||
+                                    container.querySelector('[contenteditable]') ||
+                                    container.querySelector('iframe');
                     if (textarea) {
                         blanks.push({ index: i, element: textarea, tag: textarea.tagName.toLowerCase() });
+                    } else {
+                        // 即使容器内没找到具体元素，也把容器本身加进去
+                        blanks.push({ index: i, element: container, tag: container.tagName.toLowerCase() });
                     }
+                });
+                if (blanks.length > 0) {
+                    // Logger.info(`从 .Answer 容器（含兄弟）找到 ${blanks.length} 个填空元素`);
+                }
+            }
+
+            // 如果仍未找到，在题目文本区域查找内联填空输入
+            if (blanks.length === 0) {
+                const inlineInputs = el.querySelectorAll(
+                    '.mark_name input, .mark_name textarea, ' +
+                    'h3 input, h3 textarea, ' +
+                    '.questionTitle input, .questionTitle textarea, ' +
+                    '[class*="title"] input[type="text"], [class*="title"] textarea'
+                );
+                inlineInputs.forEach((container, i) => {
+                    blanks.push({ index: i, element: container, tag: container.tagName.toLowerCase() });
                 });
             }
 
             // 获取隐藏的答案输入
             const questionId = el.getAttribute('data') || el.getAttribute('data-id') || el.getAttribute('id') || '';
             const hiddenAnswer = questionId ? el.querySelector(`#answer${questionId}`) : null;
+
+            // 如果刚才没有执行 DOM 强制修正，现在有了 blanks 信息，再修正一次
+            if (blanks.length > 0 && options.length === 0 && answerType !== 3 && answerType !== 4 && answerType !== 5) {
+                // Logger.info(`[诊断] 第 ${index+1} 题: 检测到填空框但无选项，强制修正 answerType=${answerType} -> 3`);
+                answerType = 3;
+                if (!typeName.includes('填空')) typeName = '填空题';
+            }
 
             return {
                 index,
@@ -1036,15 +1207,15 @@
 
             if (isMulti) {
                 // 多选题：提取所有字母
-                const match = answer.match(/[A-Z]/g);
+                const match = answer.match(/[A-Za-z]/g);
                 if (match) {
-                    letters = [...new Set(match)].sort();
+                    letters = [...new Set(match.map(l => l.toUpperCase()))].sort();
                 }
             } else {
                 // 单选题：取第一个字母
-                const match = answer.match(/[A-Z]/);
+                const match = answer.match(/[A-Za-z]/);
                 if (match) {
-                    letters = [match[0]];
+                    letters = [match[0].toUpperCase()];
                 }
             }
 
@@ -1097,6 +1268,7 @@
         // 填写答案
         async fill(question, parsedAnswer) {
             const type = question.answerType;
+            Logger.info(`填写答案: 类型=${type}, 答案类型=${parsedAnswer.type}`);
 
             switch (type) {
                 case 0: // 单选题
@@ -1112,6 +1284,22 @@
                 case 6: // 计算题
                 case 7: // 问答题
                     await this._fillText(question, parsedAnswer);
+                    break;
+                default:
+                    // 未知题型: 尝试智能填写
+                    Logger.warn(`未知题型(${type})，尝试智能填写...`);
+                    if (parsedAnswer.type === 'blank' && parsedAnswer.parts) {
+                        await this._fillBlank(question, parsedAnswer);
+                    } else if (parsedAnswer.type === 'text' && parsedAnswer.content) {
+                        await this._fillText(question, parsedAnswer);
+                    } else {
+                        // 最后尝试: 先当填空填，填不了再当文本填
+                        const rawAnswer = parsedAnswer.parts ? parsedAnswer.parts.join('') :
+                                         parsedAnswer.content || parsedAnswer.letters?.join('') || '';
+                        if (rawAnswer) {
+                            await this._fillBlank(question, { type: 'blank', parts: [rawAnswer] });
+                        }
+                    }
                     break;
             }
         },
@@ -1160,47 +1348,539 @@
             const { parts } = parsedAnswer;
             Logger.info(`填空题答案: ${JSON.stringify(parts)}, 空白数: ${question.blanks.length}`);
 
-            // 如果 blanks 为空，尝试直接查找
-            let blanks = question.blanks;
-            if (blanks.length === 0) {
-                Logger.warn('未找到填空元素，尝试重新查找...');
-                const selectors = [
-                    '.Answer textarea',
-                    'textarea[name^="answerEditor"]',
-                    '.Answer [contenteditable]',
-                    '.edui-body-container',
-                    'textarea',
-                    'input[type="text"]'
-                ];
-                for (const sel of selectors) {
-                    const elements = question.element.querySelectorAll(sel);
-                    if (elements.length > 0) {
-                        blanks = Array.from(elements).map((el, i) => ({ index: i, element: el }));
-                        Logger.info(`通过 ${sel} 找到 ${blanks.length} 个填空元素`);
+            // ===== 预填写诊断 =====
+            // Logger.info(`[诊断] 题目元素: <${question.element.tagName}> class="${question.element.className}"`);
+            // Logger.info(`[诊断] 题目内 .Answer=${question.element.querySelectorAll('.Answer').length}, textarea=${question.element.querySelectorAll('textarea').length}, iframe=${question.element.querySelectorAll('iframe').length}`);
+            // const nextSib = question.element.nextElementSibling;
+            // if (nextSib) Logger.info(`[诊断] 下一个兄弟: <${nextSib.tagName}> class="${nextSib.className}"`);
+            // const timuParent = question.element.closest('.TiMu') || question.element.parentElement;
+            // if (timuParent) Logger.info(`[诊断] 父元素内 .Answer=${timuParent.querySelectorAll('.Answer').length}, textarea=${timuParent.querySelectorAll('textarea').length}, iframe=${timuParent.querySelectorAll('iframe').length}`);
+
+            if (!parts || parts.length === 0) {
+                Logger.warn('没有可填写的答案');
+                return;
+            }
+
+            // ===== 查找 .Answer 容器 =====
+            // 学习通有两种布局：
+            //   布局A: .Answer 是 .questionLi 的子元素
+            //   布局B: .Answer 是 .questionLi 的兄弟元素（与 .questionLi 并列）
+            let answerContainers = Array.from(question.element.querySelectorAll('.Answer'));
+
+            // 子元素没找到，查找兄弟节点
+            if (answerContainers.length === 0) {
+                Logger.info('.Answer 不在 questionLi 内部，查找兄弟节点...');
+                let sibling = question.element.nextElementSibling;
+                while (sibling) {
+                    // 遇到下一个题目就停止
+                    if (sibling.classList.contains('questionLi') ||
+                        sibling.querySelector('.questionLi') ||
+                        sibling.classList.contains('TiMu')) {
                         break;
+                    }
+                    if (sibling.classList.contains('Answer')) {
+                        answerContainers.push(sibling);
+                    }
+                    // 也查找兄弟内部的 .Answer
+                    const nested = sibling.querySelectorAll('.Answer');
+                    nested.forEach(a => answerContainers.push(a));
+                    sibling = sibling.nextElementSibling;
+                }
+                if (answerContainers.length > 0) {
+                    Logger.info(`在兄弟节点中找到 ${answerContainers.length} 个 .Answer 容器`);
+                }
+            }
+
+            // 再试：从父元素 (.TiMu 或直接父级) 查找所有 .Answer
+            if (answerContainers.length === 0) {
+                const parent = question.element.closest('.TiMu') || question.element.parentElement;
+                if (parent) {
+                    answerContainers = Array.from(parent.querySelectorAll('.Answer'));
+                    if (answerContainers.length > 0) {
+                        Logger.info(`在父容器中找到 ${answerContainers.length} 个 .Answer 容器`);
                     }
                 }
             }
 
-            for (let i = 0; i < blanks.length; i++) {
-                const blank = blanks[i];
-                const answer = parts[i] || parts[0] || '';
-
-                if (blank.element && answer) {
-                    Logger.info(`填写第 ${i + 1} 个空: ${answer.substring(0, 30)}...`);
-                    this._fillTextarea(blank.element, answer);
+            if (answerContainers.length > 0) {
+                Logger.info(`共找到 ${answerContainers.length} 个 .Answer 容器，逐个填写...`);
+                for (let i = 0; i < answerContainers.length; i++) {
+                    const answer = parts[i] || parts[0] || '';
+                    if (!answer) {
+                        Logger.warn(`第 ${i + 1} 个空没有对应答案`);
+                        continue;
+                    }
+                    Logger.info(`填写第 ${i + 1} 个空: "${answer.substring(0, 50)}"`);
+                    try {
+                        await this._fillSingleBlank(answerContainers[i], answer, question);
+                    } catch (e) {
+                        Logger.error(`填写第 ${i + 1} 个空失败: ${e.message}`);
+                    }
                     await sleep(500);
                 }
+                this._notifyPlatform(question);
+                return;
             }
 
-            // 通知平台编辑器更新
+            // ===== 备选：收集所有可能的填空元素 =====
+            Logger.info('未找到 .Answer 容器，尝试收集填空元素...');
+            let blankElements = this._collectBlankElements(question);
+
+            if (blankElements.length === 0) {
+                Logger.info('未立即找到填空元素，等待 2 秒后重试...');
+                await sleep(2000);
+                blankElements = this._collectBlankElements(question);
+            }
+
+            if (blankElements.length === 0) {
+                Logger.error('未找到任何填空输入元素');
+                this._logDebugInfo(question);
+                return;
+            }
+
+            Logger.info(`找到 ${blankElements.length} 个填空元素，答案 ${parts.length} 个，开始填写...`);
+
+            for (let i = 0; i < Math.max(blankElements.length, parts.length); i++) {
+                const answer = parts[i] || parts[0] || '';
+                const el = blankElements[i];
+                if (!el) {
+                    Logger.warn(`第 ${i + 1} 个空没有对应元素`);
+                    continue;
+                }
+                if (!answer) {
+                    Logger.warn(`第 ${i + 1} 个空没有对应答案`);
+                    continue;
+                }
+                Logger.info(`填写第 ${i + 1} 个空: "${answer.substring(0, 50)}" -> <${el.tagName.toLowerCase()}> id=${el.id || '无'}`);
+                try {
+                    await this._fillSingleBlank(el.closest('.Answer') || el.parentElement, answer, question, el);
+                } catch (e) {
+                    Logger.error(`填写第 ${i + 1} 个空失败: ${e.message}`);
+                }
+                await sleep(500);
+            }
+
+            this._notifyPlatform(question);
+        },
+
+        // 获取正确 window 上下文的 UE 对象
+        // 关键：Tampermonkey 沙箱中，window/ownerDocument.defaultView 都是代理，
+        //        无法访问页面全局变量，必须用 unsafeWindow
+        _getUE(container) {
+            let foundUE = null;
+            // 1. 题目在 iframe 内：通过 iframe.contentWindow 获取 UE
             try {
-                if (typeof window.loadEditorAnswerd === 'function' && question.questionId) {
-                    window.loadEditorAnswerd(question.questionId, 3);
+                const ownerDoc = container?.ownerDocument;
+                if (ownerDoc && ownerDoc !== document) {
+                    // 找到包含此文档的 iframe
+                    const allIframes = document.querySelectorAll('iframe');
+                    for (const f of allIframes) {
+                        try {
+                            if (f.contentDocument === ownerDoc && f.contentWindow && f.contentWindow.UE) {
+                                foundUE = f.contentWindow.UE;
+                                break;
+                            }
+                        } catch (e) {}
+                    }
                 }
             } catch (e) {}
 
-            // 触发全局 change 事件
+            // 2. unsafeWindow（穿透 Tampermonkey 沙箱访问主页面）
+            if (!foundUE) {
+                try {
+                    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.UE) {
+                        foundUE = unsafeWindow.UE;
+                    }
+                } catch (e) {}
+            }
+
+            // 3. 普通回退
+            if (!foundUE) {
+                try {
+                    if (typeof UE !== 'undefined') foundUE = UE;
+                } catch (e) {}
+            }
+
+            // 【关键防御】自动给找到的 UEditor 打猴子补丁，防止其触发学习通的全局崩溃
+            if (foundUE && foundUE.Editor && foundUE.Editor.prototype && !foundUE._patchedByAI) {
+                try {
+                    const origHasContents = foundUE.Editor.prototype.hasContents;
+                    foundUE.Editor.prototype.hasContents = function(tags) {
+                        try { return origHasContents.call(this, tags); } 
+                        catch (e) { return true; } // 哪怕崩溃也视为有内容
+                    };
+                    
+                    const origGetContent = foundUE.Editor.prototype.getContent;
+                    foundUE.Editor.prototype.getContent = function() {
+                        try { return origGetContent.apply(this, arguments); }
+                        catch (e) { return this.body ? this.body.innerHTML : ''; } // 崩溃时直接返回底层 HTML
+                    };
+                    
+                    foundUE._patchedByAI = true;
+                    // Logger.info('已对当前 UE 实例注入防崩溃补丁');
+                } catch (e) {}
+            }
+
+            return foundUE;
+        },
+
+        // 填写单个空白 - 在指定容器内找到最佳的可编辑元素
+        async _fillSingleBlank(container, text, question, fallbackElement) {
+            if (!container) {
+                if (fallbackElement) {
+                    this._doSmartFill(fallbackElement, text);
+                    return;
+                }
+                Logger.error('容器和备选元素均为空');
+                return;
+            }
+
+            const tag = container.tagName?.toLowerCase() || '';
+            // Logger.info(`_fillSingleBlank: container=<${tag}> class="${(container.className || '').toString().substring(0, 50)}"`);
+
+            // 策略0: 通过 UEditor API（最可靠，同时设置 iframe 和 textarea）
+            const textarea = container.querySelector('textarea');
+            if (textarea && textarea.id) {
+                const filled = await this._fillViaUEditor(textarea, text, container);
+                if (filled) {
+                    this._syncToTextarea(container, text);
+                    this._syncToHiddenAnswer(question, text);
+                    return;
+                }
+            }
+
+            // 策略1: 查找 UEditor iframe 并写入其 body
+            const iframes = container.querySelectorAll('iframe');
+            // Logger.info(`  容器内 iframe 数量: ${iframes.length}`);
+            for (const iframe of iframes) {
+                try {
+                    const iDoc = iframe.contentDocument;
+                    if (!iDoc) {
+                        Logger.warn(`  iframe.contentDocument 为 null`);
+                        continue;
+                    }
+                    const body = iDoc.body;
+                    if (body && (body.getAttribute('contenteditable') === 'true' || body.isContentEditable)) {
+                        this._doFillContentEditable(body, text, iframe.contentWindow, iDoc);
+                        this._syncToTextarea(container, text);
+                        this._syncToHiddenAnswer(question, text);
+                        Logger.success(`✓ 通过 UEditor iframe body 设置内容`);
+                        return;
+                    }
+                } catch (e) {
+                    Logger.warn(`  iframe 访问失败: ${e.message}`);
+                }
+            }
+
+            // 策略2: UEditor 可能还没初始化，等待一下重试
+            if (iframes.length === 0 && textarea) {
+                // Logger.info('  未找到 iframe，等待 UEditor 初始化...');
+                await sleep(2000);
+
+                // 重试查找 iframe
+                const iframesRetry = container.querySelectorAll('iframe');
+                // Logger.info(`  重试: iframe 数量=${iframesRetry.length}`);
+                for (const iframe of iframesRetry) {
+                    try {
+                        const iDoc = iframe.contentDocument;
+                        if (!iDoc) continue;
+                        const body = iDoc.body;
+                        if (body && (body.getAttribute('contenteditable') === 'true' || body.isContentEditable)) {
+                            this._doFillContentEditable(body, text, iframe.contentWindow, iDoc);
+                            this._syncToTextarea(container, text);
+                            this._syncToHiddenAnswer(question, text);
+                            Logger.success(`✓ 通过 UEditor iframe body 设置内容（重试成功）`);
+                            return;
+                        }
+                    } catch (e) {}
+                }
+
+                // 重试 UEditor API
+                if (textarea.id) {
+                    const filled = await this._fillViaUEditor(textarea, text, container);
+                    if (filled) {
+                        this._syncToTextarea(container, text);
+                        this._syncToHiddenAnswer(question, text);
+                        return;
+                    }
+                }
+            }
+
+            // 策略3: 可见的 contenteditable 元素
+            const editables = container.querySelectorAll('[contenteditable="true"]');
+            for (const editable of editables) {
+                if (editable.offsetParent !== null || editable.offsetWidth > 0) {
+                    this._doFillContentEditable(editable, text);
+                    this._syncToTextarea(container, text);
+                    this._syncToHiddenAnswer(question, text);
+                    Logger.success(`✓ 通过 contenteditable 设置内容`);
+                    return;
+                }
+            }
+
+            // 策略4: .edui-body-container
+            const eduiBody = container.querySelector('.edui-body-container');
+            if (eduiBody) {
+                this._doFillContentEditable(eduiBody, text);
+                this._syncToTextarea(container, text);
+                this._syncToHiddenAnswer(question, text);
+                Logger.success(`✓ 通过 edui-body-container 设置内容`);
+                return;
+            }
+
+            // 策略5: 可见的 input[type="text"]
+            const visibleInput = container.querySelector('input[type="text"]');
+            if (visibleInput && visibleInput.offsetParent !== null) {
+                this._doSetInputValue(visibleInput, text);
+                this._syncToHiddenAnswer(question, text);
+                Logger.success(`✓ 通过 input[type="text"] 设置内容`);
+                return;
+            }
+
+            // 策略6: 直接设置 textarea
+            if (textarea) {
+                this._doSetInputValue(textarea, text);
+                this._syncToHiddenAnswer(question, text);
+                Logger.success(`✓ 通过 textarea 直接设置 (id=${textarea.id || '无'})`);
+                return;
+            }
+
+            // 策略7: 使用备选元素
+            if (fallbackElement) {
+                this._doSmartFill(fallbackElement, text);
+                this._syncToHiddenAnswer(question, text);
+                return;
+            }
+
+            Logger.error('容器内未找到任何可编辑元素');
+            // Logger.info(`容器 HTML: ${container.innerHTML.substring(0, 500)}`);
+            // 全局最后尝试: 直接查找容器内所有 input/textarea/contenteditable
+            const anyEditable = container.querySelector('input, textarea, [contenteditable]');
+            if (anyEditable) {
+                Logger.info(`  兜底: 找到 <${anyEditable.tagName.toLowerCase()}> id=${anyEditable.id || '无'}`);
+                this._doSmartFill(anyEditable, text);
+                this._syncToHiddenAnswer(question, text);
+            }
+        },
+
+        // 通过 UEditor API 填写（从正确的 window 上下文获取 UE）
+        _fillViaUEditor(textarea, text, container) {
+            const ue = this._getUE(container || textarea);
+            if (!ue || !textarea.id) {
+                // Logger.info(`  UEditor API 不可用 (UE=${ue ? '有' : '无'}, textarea.id=${textarea.id || '无'})`);
+                return false;
+            }
+
+            // Logger.info(`  尝试 UEditor API, textarea.id='${textarea.id}'`);
+
+            // 方式A: UE.getEditor(id)
+            try {
+                const editor = ue.getEditor(textarea.id);
+                if (editor) {
+                    if (editor.isReady) {
+                        editor.setContent(text);
+                        Logger.success(`✓ UE.getEditor('${textarea.id}').setContent()`);
+                        return true;
+                    } else {
+                        editor.ready(() => {
+                            editor.setContent(text);
+                        });
+                        Logger.success(`✓ UE editor.ready() 延迟设置`);
+                        return true;
+                    }
+                }
+            } catch (e) {
+                Logger.info(`  UE.getEditor 失败: ${e.message}`);
+            }
+
+            // 方式B: 遍历 UE.instants
+            try {
+                if (ue.instants) {
+                    for (const key in ue.instants) {
+                        const inst = ue.instants[key];
+                        if (!inst) continue;
+                        // 匹配: textarea 元素相同、或 key 包含 textarea id
+                        if (inst.textarea === textarea ||
+                            (inst.key && inst.key === textarea.id) ||
+                            key.includes(textarea.id)) {
+                            inst.setContent(text);
+                            Logger.success(`✓ UE.instants[${key}].setContent()`);
+                            return true;
+                        }
+                    }
+                }
+            } catch (e) {
+                Logger.info(`  UE.instants 遍历失败: ${e.message}`);
+            }
+
+            Logger.info(`  UEditor API 未能匹配到编辑器实例`);
+            return false;
+        },
+
+        // 同步内容到容器内的隐藏 textarea
+        _syncToTextarea(container, text) {
+            try {
+                const textareas = container.querySelectorAll('textarea');
+                textareas.forEach(ta => {
+                    try {
+                        const proto = window.HTMLTextAreaElement.prototype;
+                        const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                        nativeSetter.call(ta, text);
+                    } catch (e) {
+                        ta.value = text;
+                    }
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+                });
+            } catch (e) {}
+        },
+
+        // 同步到隐藏的 answer 输入框
+        _syncToHiddenAnswer(question, text) {
+            if (!question) return;
+            try {
+                // 设置 hiddenAnswer 元素
+                if (question.hiddenAnswer) {
+                    question.hiddenAnswer.value = text;
+                    question.hiddenAnswer.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                // 尝试用 questionId 查找
+                if (question.questionId) {
+                    const ownerDoc = question.element.ownerDocument || document;
+                    const hidden = ownerDoc.querySelector(`#answer${question.questionId}`);
+                    if (hidden) {
+                        hidden.value = text;
+                        hidden.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+            } catch (e) {}
+        },
+
+        // 智能判断元素类型并填写
+        _doSmartFill(element, text) {
+            const tag = element.tagName.toLowerCase();
+            const isContentEditable = element.getAttribute('contenteditable') === 'true' || element.isContentEditable;
+            if (isContentEditable) {
+                this._doFillContentEditable(element, text);
+            } else if (tag === 'textarea' || tag === 'input') {
+                this._doSetInputValue(element, text);
+            } else {
+                element.textContent = text;
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        },
+
+        // 收集填空元素（不含 .Answer 容器策略）
+        _collectBlankElements(question) {
+            let blankElements = [];
+
+            // 从 blanks 获取
+            for (const b of question.blanks) {
+                if (b.element && b.element.isConnected !== false) {
+                    blankElements.push(b.element);
+                }
+            }
+            if (blankElements.length > 0) return blankElements;
+
+            // 从题目元素内用选择器查找
+            const selectors = [
+                '.blank_box input[type="text"]', '.tkInput', 'input.cloze',
+                '[class*="fillblank"] input', '[class*="tiankong"] input',
+                '.Answer input[type="text"]', '.Answer textarea',
+                'textarea[name^="answerEditor"]',
+                '.edui-body-container', '[contenteditable="true"]',
+                'textarea', 'input[type="text"]'
+            ];
+            for (const sel of selectors) {
+                const found = question.element.querySelectorAll(sel);
+                if (found.length > 0) {
+                    blankElements = Array.from(found);
+                    Logger.info(`通过 ${sel} 在题目内找到 ${found.length} 个填空元素`);
+                    break;
+                }
+            }
+            if (blankElements.length > 0) return blankElements;
+
+            // 从兄弟和父元素查找
+            const parent = question.element.closest('.TiMu') || question.element.parentElement;
+            if (parent) {
+                const all = parent.querySelectorAll(
+                    '.Answer textarea, .Answer input[type="text"], ' +
+                    '[contenteditable="true"], .edui-body-container'
+                );
+                blankElements = Array.from(all).filter(el => !el.closest('#ai-answer-panel'));
+            }
+            return blankElements;
+        },
+
+        // 输出调试信息
+        _logDebugInfo(question) {
+            Logger.info(`题目元素标签: ${question.element.tagName}, 类名: ${question.element.className}`);
+            Logger.info(`题目 HTML 片段: ${question.element.innerHTML.substring(0, 500)}`);
+            // 打印兄弟节点信息
+            let sib = question.element.nextElementSibling;
+            let sibIdx = 0;
+            while (sib && sibIdx < 5) {
+                Logger.info(`兄弟[${sibIdx}]: <${sib.tagName.toLowerCase()}> class="${(sib.className || '').toString().substring(0, 50)}"`);
+                sibIdx++;
+                sib = sib.nextElementSibling;
+            }
+            // 打印父容器信息
+            const parent = question.element.closest('.TiMu') || question.element.parentElement;
+            if (parent) {
+                const answers = parent.querySelectorAll('.Answer');
+                const textareas = parent.querySelectorAll('textarea');
+                const iframes = parent.querySelectorAll('iframe');
+                Logger.info(`父容器: .Answer=${answers.length}, textarea=${textareas.length}, iframe=${iframes.length}`);
+            }
+            // 打印题目内元素
+            const allInputs = question.element.querySelectorAll('input, textarea, [contenteditable], iframe');
+            if (allInputs.length > 0) {
+                Logger.info(`题目内共有 ${allInputs.length} 个输入/iframe元素:`);
+                allInputs.forEach((inp, i) => {
+                    const tag = inp.tagName.toLowerCase();
+                    const cls = (inp.className || '').toString().substring(0, 40);
+                    const ce = inp.getAttribute('contenteditable') || '';
+                    const vis = inp.offsetParent !== null ? '可见' : '隐藏';
+                    const id = inp.id || '无';
+                    Logger.info(`  [${i}] <${tag}> id="${id}" class="${cls}" contenteditable="${ce}" ${vis}`);
+                });
+            } else {
+                Logger.info('题目内没有任何 input/textarea/contenteditable/iframe 元素');
+            }
+        },
+
+        // 通知平台
+        _notifyPlatform(question) {
+            if (!question) return;
+            try {
+                // loadEditorAnswerd 在页面的 window 上，Tampermonkey 沙箱中必须用 unsafeWindow
+                const qId = question.questionId;
+                if (!qId) return;
+
+                // 尝试 iframe 的 contentWindow
+                const ownerDoc = question.element.ownerDocument;
+                if (ownerDoc && ownerDoc !== document) {
+                    const allIframes = document.querySelectorAll('iframe');
+                    for (const f of allIframes) {
+                        try {
+                            if (f.contentDocument === ownerDoc && f.contentWindow) {
+                                if (typeof f.contentWindow.loadEditorAnswerd === 'function') {
+                                    f.contentWindow.loadEditorAnswerd(qId, 3);
+                                    Logger.info(`✓ 通过 iframe.contentWindow 调用 loadEditorAnswerd(${qId}, 3)`);
+                                    return;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                // unsafeWindow
+                if (typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.loadEditorAnswerd === 'function') {
+                    unsafeWindow.loadEditorAnswerd(qId, 3);
+                    Logger.info(`✓ 通过 unsafeWindow 调用 loadEditorAnswerd(${qId}, 3)`);
+                }
+            } catch (e) {}
             try {
                 question.element.dispatchEvent(new Event('change', { bubbles: true }));
             } catch (e) {}
@@ -1210,21 +1890,52 @@
             const { content } = parsedAnswer;
             Logger.info(`文本题答案: ${content.substring(0, 50)}...`);
 
-            // 尝试多种方式找到输入元素
+            // ===== 预填写诊断 =====
+            // Logger.info(`[诊断] 文本题题目元素: <${question.element.tagName}> class="${question.element.className}"`);
+            // Logger.info(`[诊断] 题目内 .Answer=${question.element.querySelectorAll('.Answer').length}, textarea=${question.element.querySelectorAll('textarea').length}, iframe=${question.element.querySelectorAll('iframe').length}`);
+
+            // 优先查找 .Answer 容器（与 _fillBlank 相同逻辑：子元素 → 兄弟 → 父级）
+            let answerContainer = question.element.querySelector('.Answer');
+
+            if (!answerContainer) {
+                // 查找兄弟节点
+                let sibling = question.element.nextElementSibling;
+                while (sibling) {
+                    if (sibling.classList.contains('questionLi') || sibling.classList.contains('TiMu')) break;
+                    if (sibling.classList.contains('Answer')) {
+                        answerContainer = sibling;
+                        break;
+                    }
+                    const nested = sibling.querySelector('.Answer');
+                    if (nested) { answerContainer = nested; break; }
+                    sibling = sibling.nextElementSibling;
+                }
+            }
+
+            if (!answerContainer) {
+                const parent = question.element.closest('.TiMu') || question.element.parentElement;
+                if (parent) answerContainer = parent.querySelector('.Answer');
+            }
+
+            if (answerContainer) {
+                Logger.info('文本题: 通过 .Answer 容器填写');
+                await this._fillSingleBlank(answerContainer, content, question);
+                this._notifyPlatform(question);
+                return;
+            }
+
+            // 备选：直接查找输入元素
             let targetElement = null;
 
-            // 方式1: 从 blanks 获取
             if (question.blanks.length > 0) {
                 targetElement = question.blanks[0].element;
             }
 
-            // 方式2: 直接查找
             if (!targetElement) {
                 const selectors = [
-                    '.Answer textarea',
                     'textarea[name^="answerEditor"]',
-                    '.Answer [contenteditable]',
                     '.edui-body-container',
+                    '[contenteditable="true"]',
                     'textarea',
                     'input[type="text"]'
                 ];
@@ -1243,123 +1954,113 @@
                 Logger.error('未找到文本输入元素');
             }
 
-            // 通知平台
-            try {
-                if (typeof window.loadEditorAnswerd === 'function' && question.questionId) {
-                    window.loadEditorAnswerd(question.questionId, question.answerType);
-                }
-            } catch (e) {}
-
-            // 触发全局 change 事件
-            try {
-                question.element.dispatchEvent(new Event('change', { bubbles: true }));
-            } catch (e) {}
+            this._notifyPlatform(question);
         },
 
         _fillTextarea(element, text) {
-            const tag = element.tagName.toLowerCase();
-            const isContentEditable = element.getAttribute('contenteditable') === 'true';
-
-            Logger.info(`填写元素: <${tag}>, contenteditable=${isContentEditable}, id=${element.id || '无'}`);
-
-            // 方式1: UEditor API（最可靠）
+            // 此方法现在仅用于简答题等非填空题，填空题走 _fillSingleBlank
             try {
-                // 查找 UEditor 实例
-                if (typeof UE !== 'undefined') {
-                    // 尝试通过 ID 获取
-                    let editor = null;
-                    if (element.id) {
-                        editor = UE.getEditor(element.id);
-                    }
-                    // 尝试从父容器查找
-                    if (!editor || !editor.ready) {
-                        const editorContainer = element.closest('.edui-editor') || element.closest('[id^="edui"]');
-                        if (editorContainer) {
-                            const textarea = editorContainer.querySelector('textarea');
-                            if (textarea && textarea.id) {
-                                editor = UE.getEditor(textarea.id);
-                            }
-                        }
-                    }
-                    if (editor && editor.ready && editor.setContent) {
-                        editor.setContent(text);
-                        Logger.info('已通过 UEditor API 设置内容');
-                        return;
-                    }
+                const container = element.closest('.Answer') || element.closest('.answer_content') || element.parentElement;
+                if (container) {
+                    this._fillSingleBlank(container, text, null, element);
+                } else {
+                    this._doSmartFill(element, text);
                 }
             } catch (e) {
-                Logger.warn(`UEditor 方式失败: ${e.message}`);
+                Logger.error(`_fillTextarea 异常: ${e.message}`);
             }
+        },
 
-            // 方式2: 查找附近的 UEditor body container
+        // 辅助: 填写 contenteditable 元素
+        // win/doc 参数用于 iframe 场景：传入 iframe.contentWindow / iframe.contentDocument
+        _doFillContentEditable(element, text, win, doc) {
+            const targetDoc = doc || (element.ownerDocument || document);
             try {
-                const answerDiv = element.closest('.Answer') || element.closest('.answer_content') || element.parentElement;
-                if (answerDiv) {
-                    const editorBody = answerDiv.querySelector('.edui-body-container') ||
-                                      answerDiv.querySelector('.edui-body-container[contenteditable]');
-                    if (editorBody) {
-                        editorBody.innerHTML = `<p>${text}</p>`;
-                        editorBody.dispatchEvent(new Event('input', { bubbles: true }));
-                        editorBody.dispatchEvent(new Event('change', { bubbles: true }));
-                        Logger.info('已通过 edui-body-container 设置内容');
-                        return;
-                    }
-                }
-            } catch (e) {
-                Logger.warn(`edui-body 方式失败: ${e.message}`);
-            }
+                element.focus();
+            } catch (e) {}
 
-            // 方式3: contenteditable 元素
-            if (isContentEditable) {
-                element.innerHTML = `<p>${text}</p>`;
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
-                Logger.info('已通过 contenteditable 设置内容');
-                return;
-            }
-
-            // 方式4: iframe 中的编辑器
+            // 方法1: 直接设置 innerHTML（最可靠，兼容性最好）
             try {
-                const answerDiv = element.closest('.Answer') || element.parentElement;
-                if (answerDiv) {
-                    const iframe = answerDiv.querySelector('iframe');
-                    if (iframe && iframe.contentDocument) {
-                        const body = iframe.contentDocument.body;
-                        if (body) {
-                            body.innerHTML = `<p>${text}</p>`;
-                            body.dispatchEvent(new Event('input', { bubbles: true }));
-                            Logger.info('已通过 iframe body 设置内容');
-                            return;
-                        }
-                    }
-                }
+                element.innerHTML = text;
+                Logger.info('✓ 已通过 innerHTML 设置 contenteditable 内容');
             } catch (e) {
-                Logger.warn(`iframe 方式失败: ${e.message}`);
+                // 方法2: textContent 兜底
+                try {
+                    element.textContent = text;
+                    Logger.info('✓ 已通过 textContent 设置 contenteditable 内容');
+                } catch (e2) {
+                    Logger.warn(`contenteditable 设置失败: ${e2.message}`);
+                    return;
+                }
             }
 
-            // 方式5: 标准 textarea/input
-            if (tag === 'textarea' || tag === 'input') {
-                // 使用原生输入模拟
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
-                    'value'
-                ).set;
-                nativeInputValueSetter.call(element, text);
+            // 方法3: 同时尝试 execCommand（某些编辑器需要）
+            try {
+                const targetWin = win || (targetDoc.defaultView) || window;
+                const sel = targetWin.getSelection();
+                if (sel) {
+                    const range = targetDoc.createRange();
+                    range.selectNodeContents(element);
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }
+            } catch (e) {}
 
-                // 触发完整的事件序列
-                element.dispatchEvent(new Event('focus', { bubbles: true }));
+            // 触发事件
+            try {
                 element.dispatchEvent(new Event('input', { bubbles: true }));
                 element.dispatchEvent(new Event('change', { bubbles: true }));
                 element.dispatchEvent(new Event('blur', { bubbles: true }));
-                Logger.info('已通过原生 setter 设置内容');
-                return;
-            }
+            } catch (e) {}
 
-            // 方式6: 兜底 - 直接设置
-            element.value = text;
-            element.innerHTML = text;
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            Logger.info('已通过兜底方式设置内容');
+            // 验证
+            const actual = element.textContent || element.innerText || '';
+            if (actual.trim()) {
+                Logger.info(`  验证内容: "${actual.substring(0, 50)}"`);
+            } else {
+                Logger.warn(`  验证失败: 内容为空`);
+            }
+        },
+
+        // 辅助: 设置 input/textarea 的值
+        _doSetInputValue(element, text) {
+            try {
+                const tag = element.tagName.toLowerCase();
+                // 先聚焦
+                element.focus();
+                element.dispatchEvent(new Event('focus', { bubbles: true }));
+
+                // 使用原生 setter 绕过框架拦截
+                try {
+                    const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                    const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    nativeSetter.call(element, text);
+                } catch (e) {
+                    element.value = text;
+                }
+
+                // 触发事件序列
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
+                element.dispatchEvent(new Event('blur', { bubbles: true }));
+                try { element.dispatchEvent(new CustomEvent('valuechange', { bubbles: true })); } catch (e) {}
+
+                // 验证
+                const actual = element.value || '';
+                Logger.info(`✓ 已设置 <${tag}> 值 (验证: "${actual.substring(0, 30)}")`);
+
+                // 同时查找并更新关联的 contenteditable 或可见输入
+                const parent = element.closest('.Answer') || element.closest('.answer_content') || element.parentElement;
+                if (parent) {
+                    const editable = parent.querySelector('[contenteditable="true"]');
+                    if (editable && editable.offsetParent !== null) {
+                        this._doFillContentEditable(editable, text);
+                    }
+                }
+            } catch (e) {
+                Logger.warn(`input/textarea 设置失败: ${e.message}`);
+            }
         }
     };
 
@@ -1417,10 +2118,36 @@
                 this._progress = { current: 0, total: questions.length };
                 this._updateProgress();
 
-                // 获取起始题号
-                const startFrom = Math.max(1, parseInt(document.getElementById('ai-start-from')?.value) || 1);
+                // 自动检测第一道未答题号
+                const startInput = document.getElementById('ai-start-from');
+                const userModified = startInput?.dataset.userModified === 'true';
+                let firstUnanswered = 1;
+                let alreadyAnswered = 0;
+                for (let i = 0; i < questions.length; i++) {
+                    if (this._isAnswered(questions[i])) {
+                        alreadyAnswered++;
+                    } else if (firstUnanswered === 1) {
+                        firstUnanswered = i + 1;
+                    }
+                }
+                // 如果全部已答完，默认第1题
+                if (alreadyAnswered === questions.length) {
+                    firstUnanswered = 1;
+                }
+                // 只在用户未手动修改时自动填充
+                if (startInput && !userModified) {
+                    startInput.value = firstUnanswered;
+                }
+
+                if (alreadyAnswered > 0) {
+                    Logger.info(`检测到 ${alreadyAnswered} 道已答题目，将自动跳过`);
+                }
+
+                // 获取起始题号（优先用用户手动输入的值，否则用自动检测的）
+                const userStart = parseInt(startInput?.value) || 1;
+                const startFrom = Math.max(1, userStart);
                 if (startFrom > 1) {
-                    Logger.info(`从第 ${startFrom} 题开始`);
+                    Logger.info(`从第 ${startFrom} 题开始（跳过前 ${startFrom - 1} 道已答题目）`);
                 }
 
                 let skipped = 0;
@@ -1441,13 +2168,14 @@
                         continue;
                     }
 
-                    // 检查是否已答过
+                    // 检查是否已答过（重新从 DOM 获取最新状态）
                     if (this._isAnswered(q)) {
+                        Logger.info(`[${i + 1}/${questions.length}] 跳过已答题目: ${q.title.substring(0, 30)}...`);
                         skipped++;
                         continue;
                     }
 
-                    Logger.info(`[${i + 1}/${questions.length}] ${q.typeName}: ${q.title.substring(0, 30)}...`);
+                    Logger.info(`[${i + 1}/${questions.length}] ${q.typeName}(类型${q.answerType}): ${q.title.substring(0, 30)}...`);
 
                     try {
                         // 构建 prompt
@@ -1509,6 +2237,11 @@
                     }
                     Logger.success('所有题目处理完成！');
 
+                    // 重置手动修改标记，下次自动检测
+                    if (startInput) {
+                        delete startInput.dataset.userModified;
+                    }
+
                     // 自动提交
                     if (CONFIG.autoSubmit) {
                         Logger.info('准备自动提交...');
@@ -1538,27 +2271,84 @@
             const el = question.element;
             const type = question.answerType;
 
+            // 如果 DOM 元素已失效，无法判断，视为未答
+            if (!el || !el.isConnected) return false;
+
             // 选择题/判断题：检查是否有选项被选中
             if (type === 0 || type === 1 || type === 2) {
-                return el.querySelectorAll('.check_answer').length > 0;
+                // 检查原生 input 选中状态（最可靠）
+                if (el.querySelectorAll('input[type="radio"]:checked, input[type="checkbox"]:checked').length > 0) return true;
+
+                // 检查选中态类名（覆盖学习通各种可能的命名）
+                const selectedEls = el.querySelectorAll(
+                    '.check_answer, .answerBg_on, .on, .active, ' +
+                    '[class*="check_answer"], [class*="answerBg_on"]'
+                );
+                if (selectedEls.length > 0) return true;
+
+                // 检查所有选项元素及子元素
+                const options = el.querySelectorAll('.answerBg, .answer_li, li, [class*="option"]');
+                for (const opt of options) {
+                    const cls = opt.className || '';
+                    if (/\bcheck_answer\b|\banswerBg_on\b|\bactive\b|\bon\b/.test(cls)) return true;
+
+                    // 检查选项子元素是否有选中标记
+                    if (opt.querySelector('.check, .checked, .icon-check, [class*="check_icon"], [class*="select"]')) return true;
+
+                    // 检查隐藏 input
+                    if (opt.querySelector('input:checked')) return true;
+
+                    // 检查 aria 属性
+                    if (opt.getAttribute('aria-checked') === 'true' || opt.getAttribute('aria-selected') === 'true') return true;
+                    if (opt.getAttribute('data-checked') === 'true' || opt.getAttribute('data-selected') === 'true') return true;
+                }
+
+                // 检查题目级别的已答标记
+                if (el.querySelector('[class*="answered"], [class*="done"], [class*="complete"]')) return true;
+                if (el.getAttribute('data-answered') === 'true') return true;
+
+                return false;
             }
 
-            // 填空题/简答题等：检查 textarea 是否有内容
+            // 填空题/简答题等：检查是否有内容
             if (type >= 3) {
-                const textareas = el.querySelectorAll('textarea');
-                for (const ta of textareas) {
-                    if (ta.value && ta.value.trim().length > 0) return true;
+                // 直接使用我们在 _parseQuestion 中辛苦收集的 blanks 数组
+                if (question.blanks && question.blanks.length > 0) {
+                    let hasAnyText = false;
+                    for (const b of question.blanks) {
+                        const target = b.element;
+                        if (!target) continue;
+                        
+                        let text = '';
+                        if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT') {
+                            text = target.value || '';
+                        } else if (target.tagName === 'IFRAME') {
+                            try {
+                                text = target.contentDocument?.body?.textContent || '';
+                            } catch (e) {}
+                        } else {
+                            text = target.textContent || '';
+                        }
+                        
+                        if (text.trim().length > 0) {
+                            hasAnyText = true;
+                            break;
+                        }
+                    }
+                    if (hasAnyText) return true;
+                } else {
+                    // 兜底查找
+                    const textareas = el.querySelectorAll('textarea');
+                    for (const ta of textareas) {
+                        if (ta.value && ta.value.trim().length > 0) return true;
+                    }
+                    const editables = el.querySelectorAll('[contenteditable="true"], .edui-body-container');
+                    for (const ed of editables) {
+                        if (ed.textContent && ed.textContent.trim().length > 0) return true;
+                    }
                 }
-                // 也检查 contenteditable 元素
-                const editables = el.querySelectorAll('[contenteditable="true"]');
-                for (const ed of editables) {
-                    if (ed.textContent && ed.textContent.trim().length > 0) return true;
-                }
-                // 检查 UEditor
-                const editorBodies = el.querySelectorAll('.edui-body-container');
-                for (const body of editorBodies) {
-                    if (body.textContent && body.textContent.trim().length > 0) return true;
-                }
+                
+                // 绝对不要用 name*="answer" 匹配 hidden input，因为会匹配到 answertype="2" 导致全部被跳过！
             }
 
             return false;
@@ -1605,7 +2395,7 @@
             if (text) {
                 text.textContent = `${this._progress.current} / ${this._progress.total}`;
             }
-            // 实时更新起始题号，停止后可从下一题继续
+            // 实时更新起始题号为下一题，停止后可从下一题继续
             if (startInput && this._progress.current > 0) {
                 startInput.value = Math.min(this._progress.current + 1, this._progress.total);
             }
@@ -1641,8 +2431,8 @@
                             <span class="status-badge ready" id="ai-status">就绪</span>
                         </div>
                         <div class="config-group">
-                            <label>从第几题开始</label>
-                            <input type="number" id="ai-start-from" value="1" min="1" placeholder="输入题号">
+                            <label>从第几题开始（自动跳过已答题目）</label>
+                            <input type="number" id="ai-start-from" value="1" min="1" placeholder="自动检测">
                         </div>
                         <button class="btn-primary" id="ai-start-btn">开始答题</button>
                         <button class="btn-secondary" id="ai-stop-btn" style="display:none;">停止</button>
@@ -1766,6 +2556,14 @@
                 this._dragging = false;
             });
 
+            // 跟踪用户手动修改起始题号
+            const startFromInput = document.getElementById('ai-start-from');
+            if (startFromInput) {
+                startFromInput.addEventListener('input', () => {
+                    startFromInput.dataset.userModified = 'true';
+                });
+            }
+
             // 开始答题
             document.getElementById('ai-start-btn').addEventListener('click', () => {
                 Controller.start();
@@ -1845,7 +2643,13 @@
                             const titleEl = el.querySelector('h3.mark_name') || el.querySelector('.mark_name') || el.querySelector('h3');
                             const title = titleEl ? titleEl.textContent.trim().substring(0, 40) : '无';
                             const opts = el.querySelectorAll('.answerBg').length;
-                            const blanks = el.querySelectorAll('.Answer textarea, textarea').length;
+                            const blanks = el.querySelectorAll(
+                                '.Answer textarea, .Answer input[type="text"], ' +
+                                '.blank_box input, .tkInput, input.cloze, .cloze input, ' +
+                                '[class*="fillblank"] input, [class*="tiankong"] input, ' +
+                                '.mark_name input, textarea, input[type="text"][name*="answer"], ' +
+                                '[contenteditable="true"]'
+                            ).length;
                             Logger.info(`  [${i}] typename="${typename}" answertype=${typeVal} 选项=${opts} 填空=${blanks}`);
                             Logger.info(`      标题: ${title}`);
                             Logger.info(`      类名: ${el.className}`);
