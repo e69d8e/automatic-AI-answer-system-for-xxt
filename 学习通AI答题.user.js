@@ -137,21 +137,81 @@
             pointer-events: none !important;
         }
         #ai-answer-panel.collapsed {
-            width: 48px;
-            height: 48px;
+            width: 52px;
+            height: 52px;
             border-radius: 50%;
             cursor: pointer;
             overflow: hidden;
-            border-color: ${C.hairline};
+            border: none;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2), 0 0 0 1px ${C.hairlineSoft};
+        }
+        #ai-answer-panel.collapsed:hover {
+            transform: scale(1.08);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25), 0 0 0 1px ${C.accentTeal};
         }
         #ai-answer-panel.collapsed .panel-body,
-        #ai-answer-panel.collapsed .panel-header span,
+        #ai-answer-panel.collapsed .panel-header .panel-title-text,
         #ai-answer-panel.collapsed .panel-header .panel-controls {
             display: none;
         }
         #ai-answer-panel.collapsed .panel-header {
-            padding: 12px;
+            padding: 0;
+            width: 100%;
+            height: 100%;
             justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, ${C.surfaceDarkElevated}, ${C.surfaceDark});
+            border-radius: 50%;
+        }
+        .panel-logo-minimized {
+            display: none;
+        }
+        #ai-answer-panel.collapsed .panel-logo-minimized {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            width: 100%;
+            height: 100%;
+            animation: pulse-glow 2.5s infinite ease-in-out;
+            user-select: none;
+        }
+        #ai-answer-panel.collapsed:after {
+            content: "AI 答题助手";
+            position: absolute;
+            right: 64px;
+            top: 50%;
+            transform: translateY(-50%) translateX(10px);
+            background: ${C.surfaceDark};
+            color: ${C.onDark};
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            border: 1px solid ${C.hairlineSoft};
+        }
+        #ai-answer-panel.collapsed:hover:after {
+            opacity: 1;
+            transform: translateY(-50%) translateX(0);
+        }
+        @keyframes pulse-glow {
+            0% {
+                transform: scale(1);
+                filter: drop-shadow(0 0 2px rgba(93, 184, 166, 0.3));
+            }
+            50% {
+                transform: scale(1.08);
+                filter: drop-shadow(0 0 6px rgba(93, 184, 166, 0.7));
+            }
+            100% {
+                transform: scale(1);
+                filter: drop-shadow(0 0 2px rgba(93, 184, 166, 0.3));
+            }
         }
         .panel-header {
             display: flex;
@@ -187,6 +247,15 @@
         }
         .panel-controls button:hover {
             background: ${C.surfaceDarkSoft};
+        }
+        #ai-collapse-btn {
+            font-size: 18px;
+            font-weight: bold;
+            transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease !important;
+        }
+        #ai-collapse-btn:hover {
+            color: ${C.accentTeal};
+            transform: scale(1.1);
         }
         .panel-body {
             padding: 16px;
@@ -1581,13 +1650,15 @@
         _offset: { x: 0, y: 0 },
         _panelWidth: 0,
         _panelHeight: 0,
+        _dragStartPos: null,
 
         create() {
             const panel = document.createElement('div');
             panel.id = 'ai-answer-panel';
             panel.innerHTML = `
                 <div class="panel-header" id="ai-panel-header">
-                    <span>🤖 AI 答题助手</span>
+                    <div class="panel-logo-minimized">🤖</div>
+                    <span class="panel-title-text">🤖 AI 答题助手</span>
                     <div class="panel-controls">
                         <button id="ai-collapse-btn" title="折叠">−</button>
                     </div>
@@ -1702,12 +1773,18 @@
                 });
             });
 
-            document.getElementById('ai-collapse-btn').addEventListener('click', () => {
+            document.getElementById('ai-collapse-btn').addEventListener('click', (e) => {
                 this._el.classList.toggle('collapsed');
+                e.stopPropagation();
             });
             this._el.querySelector('.panel-header').addEventListener('click', (e) => {
                 if (this._el.classList.contains('collapsed')) {
+                    if (this._dragStartPos) {
+                        const dist = Math.hypot(e.clientX - this._dragStartPos.x, e.clientY - this._dragStartPos.y);
+                        if (dist > 5) return;
+                    }
                     this._el.classList.remove('collapsed');
+                    document.body.classList.remove('ai-dragging');
                 }
             });
 
@@ -1722,6 +1799,7 @@
                 this._offset.y = e.clientY - rect.top;
                 this._panelWidth = rect.width;
                 this._panelHeight = rect.height;
+                this._dragStartPos = { x: e.clientX, y: e.clientY };
                 e.preventDefault();
             });
 
