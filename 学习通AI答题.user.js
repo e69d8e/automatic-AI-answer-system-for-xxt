@@ -128,7 +128,13 @@
             font-size: 14px;
             color: ${C.body};
             overflow: hidden;
-            transition: all 0.3s ease;
+            transition: opacity 0.25s ease, transform 0.25s ease, width 0.3s ease, height 0.3s ease, border-radius 0.3s ease, background-color 0.3s ease, box-shadow 0.3s ease;
+        }
+        #ai-answer-panel.dragging {
+            transition: none !important;
+        }
+        body.ai-dragging iframe {
+            pointer-events: none !important;
         }
         #ai-answer-panel.collapsed {
             width: 48px;
@@ -1573,6 +1579,8 @@
         _el: null,
         _dragging: false,
         _offset: { x: 0, y: 0 },
+        _panelWidth: 0,
+        _panelHeight: 0,
 
         create() {
             const panel = document.createElement('div');
@@ -1707,29 +1715,51 @@
             header.addEventListener('mousedown', (e) => {
                 if (e.target.tagName === 'BUTTON') return;
                 this._dragging = true;
+                this._el.classList.add('dragging');
+                document.body.classList.add('ai-dragging');
                 const rect = this._el.getBoundingClientRect();
                 this._offset.x = e.clientX - rect.left;
                 this._offset.y = e.clientY - rect.top;
+                this._panelWidth = rect.width;
+                this._panelHeight = rect.height;
                 e.preventDefault();
             });
+
+            let mouseX = 0;
+            let mouseY = 0;
+            let tick = false;
             document.addEventListener('mousemove', (e) => {
                 if (!this._dragging) return;
-                let left = e.clientX - this._offset.x;
-                let top = e.clientY - this._offset.y;
-                
-                const rect = this._el.getBoundingClientRect();
-                const viewportWidth = window.innerWidth;
-                const viewportHeight = window.innerHeight;
-                
-                left = Math.max(0, Math.min(left, viewportWidth - rect.width));
-                top = Math.max(0, Math.min(top, viewportHeight - rect.height));
-                
-                this._el.style.left = left + 'px';
-                this._el.style.top = top + 'px';
-                this._el.style.right = 'auto';
+                mouseX = e.clientX;
+                mouseY = e.clientY;
+                if (!tick) {
+                    window.requestAnimationFrame(() => {
+                        if (this._dragging) {
+                            let left = mouseX - this._offset.x;
+                            let top = mouseY - this._offset.y;
+                            
+                            const viewportWidth = window.innerWidth;
+                            const viewportHeight = window.innerHeight;
+                            
+                            left = Math.max(0, Math.min(left, viewportWidth - this._panelWidth));
+                            top = Math.max(0, Math.min(top, viewportHeight - this._panelHeight));
+                            
+                            this._el.style.left = left + 'px';
+                            this._el.style.top = top + 'px';
+                            this._el.style.right = 'auto';
+                        }
+                        tick = false;
+                    });
+                    tick = true;
+                }
             });
+
             document.addEventListener('mouseup', () => {
-                this._dragging = false;
+                if (this._dragging) {
+                    this._dragging = false;
+                    this._el.classList.remove('dragging');
+                    document.body.classList.remove('ai-dragging');
+                }
             });
 
             const startFromInput = document.getElementById('ai-start-from');
