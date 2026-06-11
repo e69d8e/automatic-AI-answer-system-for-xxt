@@ -170,11 +170,23 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 24px;
             width: 100%;
             height: 100%;
             animation: pulse-glow 2.5s infinite ease-in-out;
             user-select: none;
+        }
+        #ai-answer-panel.collapsed .panel-logo-minimized svg {
+            width: 26px;
+            height: 26px;
+            color: ${C.accentTeal};
+        }
+        .ai-logo-icon {
+            width: 18px;
+            height: 18px;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 6px;
+            color: ${C.accentTeal};
         }
         #ai-answer-panel.collapsed:after {
             content: "AI 答题助手";
@@ -222,10 +234,12 @@
             color: ${C.onDark};
             cursor: move;
         }
-        .panel-header span {
+        .panel-header .panel-title-text {
             font-weight: 600;
             font-size: 15px;
             letter-spacing: 0;
+            display: flex;
+            align-items: center;
         }
         .panel-controls {
             display: flex;
@@ -1657,8 +1671,23 @@
             panel.id = 'ai-answer-panel';
             panel.innerHTML = `
                 <div class="panel-header" id="ai-panel-header">
-                    <div class="panel-logo-minimized">🤖</div>
-                    <span class="panel-title-text">🤖 AI 答题助手</span>
+                    <div class="panel-logo-minimized">
+                        <svg class="ai-logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="6" width="18" height="13" rx="3" />
+                            <path d="M8 12h.01M16 12h.01" stroke-width="3" />
+                            <path d="M9 15h6" />
+                            <path d="M12 6V3" />
+                        </svg>
+                    </div>
+                    <span class="panel-title-text">
+                        <svg class="ai-logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="6" width="18" height="13" rx="3" />
+                            <path d="M8 12h.01M16 12h.01" stroke-width="3" />
+                            <path d="M9 15h6" />
+                            <path d="M12 6V3" />
+                        </svg>
+                        AI 答题助手
+                    </span>
                     <div class="panel-controls">
                         <button id="ai-collapse-btn" title="折叠">−</button>
                     </div>
