@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.2.0
 // @description  调用DeepSeek/MiMo AI自动完成学习通作业和考试题目
-// @author       You
+// @author       李荣宁
 // @match        *://*.chaoxing.com/*
 // @match        *://*.edu.cn/*
 // @grant        GM_xmlhttpRequest
